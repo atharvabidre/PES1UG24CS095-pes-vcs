@@ -92,19 +92,47 @@ int object_exists(const ObjectID *id) {
 //
 
 //
-// Returns 0 on success, -1 on error.
-int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
-}
 
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
+    const char *type_str = (type == OBJ_BLOB) ? "blob" :
+                           (type == OBJ_TREE) ? "tree" : "commit";
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+
+    size_t total = header_len + len;
+    uint8_t *full = malloc(total);
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
+
+    compute_hash(full, total, id_out);
+
+    if (object_exists(id_out)) { free(full); return 0; }
+
+    char path[512], tmp_path[520], dir[512];
+    object_path(id_out, path, sizeof(path));
+    strncpy(dir, path, sizeof(dir));
+    *strrchr(dir, '/') = '\0';
+    mkdir(dir, 0755);
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    write(fd, full, total);
+    fsync(fd);
+    close(fd);
+    free(full);
+
+    rename(tmp_path, path);
+
+    int dir_fd = open(dir, O_RDONLY);
+    fsync(dir_fd);
+    close(dir_fd);
+
+    return 0;
+}
 // Read an object from the store.
 //
 // Steps:
 //   1. Build the file path from the hash using object_path()
-//   2. Open and read the entire file
-//   3. Parse the header to extract the type string and size
 //   4. Verify integrity: recompute the SHA-256 of the file contents
 //      and compare to the expected hash (from *id). Return -1 if mismatch.
 //   5. Set *type_out to the parsed ObjectType
@@ -120,9 +148,36 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 //   - malloc, memcpy     : allocating and returning the extracted data
 //
 // The caller is responsible for calling free(*data_out).
-// Returns 0 on success, -1 on error (file not found, corrupt, etc.).
+
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *buf = malloc(file_size);
+    fread(buf, 1, file_size, f);
+    fclose(f);
+
+    ObjectID actual;
+    compute_hash(buf, file_size, &actual);
+    if (memcmp(actual.hash, id->hash, HASH_SIZE) != 0) { free(buf); return -1; }
+
+    uint8_t *null_byte = memchr(buf, '\0', file_size);
+    if (!null_byte) { free(buf); return -1; }
+
+    if      (strncmp((char*)buf, "blob",   4) == 0) *type_out = OBJ_BLOB;
+    else if (strncmp((char*)buf, "tree",   4) == 0) *type_out = OBJ_TREE;
+    else if (strncmp((char*)buf, "commit", 6) == 0) *type_out = OBJ_COMMIT;
+    else { free(buf); return -1; }
+
+    size_t header_len = (null_byte - buf) + 1;
+    *len_out = file_size - header_len;
+    *data_out = malloc(*len_out);
+    memcpy(*data_out, null_byte + 1, *len_out);
+    free(buf);
+    return 0;
 }
